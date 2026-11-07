@@ -127,3 +127,11 @@ In `translator/translator/src/passes/air_calls/integer_simd.rs` & `reduce_bitops
   Splats byte masks `0x000000ff`, `0x0000ff00`, `0x00ff0000`, `0xff000000` with shift counts `8` and `24` across lanes.
 - Handles all lane counts: `v2i16`, `v4i16`, `v2i32`, `v3i32`, `v4i32`, and scalar `i16`/`i32`.
 
+---
+
+## 📄 License
+
+This project is licensed under the **PolyForm Noncommercial License 1.0.0** (same as the NullMoth NVIDIA driver for macOS).
+See [LICENSE](LICENSE) for details.
+
+

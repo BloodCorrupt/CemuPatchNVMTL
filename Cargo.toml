@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 authors = ["bloodtek", "Antigravity"]
 description = "A harmless companion tool to fix Cemu graphics pipeline creation on official NullMoth NVIDIA macOS driver"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
