@@ -1,0 +1,198 @@
+diff --git a/translator/translator/src/native/tests/intrinsics.rs b/translator/translator/src/native/tests/intrinsics.rs
+index e3a45f0..3c006fc 100644
+--- a/translator/translator/src/native/tests/intrinsics.rs
++++ b/translator/translator/src/native/tests/intrinsics.rs
+@@ -1285,6 +1285,51 @@ declare i32 @llvm.bswap.i32(i32)
+     }
+ }
+ 
++fn assert_native_bswap_vector_i16_lowers(lanes: u32) {
++    let ll = format!(
++        r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @main(<{lanes} x i16> %x) {{
++entry:
++  %swapped = tail call <{lanes} x i16> @llvm.bswap.v{lanes}i16(<{lanes} x i16> %x)
++  ret void
++}}
++
++declare <{lanes} x i16> @llvm.bswap.v{lanes}i16(<{lanes} x i16>)
++"#
++    );
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_bswap_v{lanes}_i16_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let module =
++        load_bytes(emit_vulkan_spirv(&ll).expect("native emit")).expect("load native spv");
++    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
++        .expect("interface transform")
++        .assemble()
++        .iter()
++        .flat_map(|w| w.to_le_bytes())
++        .collect::<Vec<_>>();
++    let asm = disassemble(&out).expect("disassemble transformed");
++    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
++    assert!(asm.contains("OpShiftRightLogical"), "{asm}");
++    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
++    assert!(asm.contains("OpBitwiseOr"), "{asm}");
++    assert!(asm.contains("OpConstantComposite"), "{asm}");
++    assert!(!asm.contains("OpFunctionCall"), "{asm}");
++}
++
++#[test]
++fn native_llvm_bswap_v2i16_lowers() {
++    assert_native_bswap_vector_i16_lowers(2);
++}
++
++#[test]
++fn native_llvm_bswap_v4i16_lowers() {
++    assert_native_bswap_vector_i16_lowers(4);
++}
++
+ fn assert_native_bswap_vector_lowers(lanes: u32) {
+     let ll = format!(
+         r#"
+diff --git a/translator/translator/src/passes/air_calls/integer_simd.rs b/translator/translator/src/passes/air_calls/integer_simd.rs
+index 353bf98..e604e1d 100644
+--- a/translator/translator/src/passes/air_calls/integer_simd.rs
++++ b/translator/translator/src/passes/air_calls/integer_simd.rs
+@@ -130,6 +130,12 @@ pub(in crate::passes) fn lower_integer_op(
+             vec![Operand::IdRef(args[0])],
+         )]));
+     }
++    if name == "llvm.bswap.i16" && args.len() == 1 {
++        if !is_int_scalar_width(ctx, rty, 16) {
++            return Err("llvm.bswap.i16 result type is not i16".to_string());
++        }
++        return Ok(Some(byte_swap_i16(ctx, res, rty, args[0])));
++    }
+     if name == "llvm.bswap.i32" && args.len() == 1 {
+         if !is_int_scalar_width(ctx, rty, 32) {
+             return Err("llvm.bswap.i32 result type is not i32".to_string());
+@@ -138,19 +144,23 @@ pub(in crate::passes) fn lower_integer_op(
+     }
+     if name.starts_with("llvm.bswap.v") && args.len() == 1 {
+         let (elem, lanes) = vector_type_shape(ctx, rty)
+-            .filter(|&(elem, _)| is_int_scalar_width(ctx, elem, 32))
+-            .ok_or_else(|| format!("{name} result type is not a vector of i32"))?;
+-        if name != format!("llvm.bswap.v{lanes}i32") {
+-            return Err(format!(
+-                "{name} does not match its <{lanes} x i32> result type (only i32 vectors are lowered)"
+-            ));
+-        }
++            .ok_or_else(|| format!("{name} result type is not a vector"))?;
+         if value_result_type(ctx, args[0]) != Some(rty) {
+             return Err(format!("{name} operand/result type mismatch"));
+         }
+-        return Ok(Some(byte_swap_i32_vector(
+-            ctx, res, rty, elem, lanes, args[0],
+-        )));
++        if is_int_scalar_width(ctx, elem, 16) {
++            if name != format!("llvm.bswap.v{lanes}i16") {
++                return Err(format!("{name} does not match its <{lanes} x i16> result type"));
++            }
++            return Ok(Some(byte_swap_i16_vector(ctx, res, rty, elem, lanes, args[0])));
++        } else if is_int_scalar_width(ctx, elem, 32) {
++            if name != format!("llvm.bswap.v{lanes}i32") {
++                return Err(format!("{name} does not match its <{lanes} x i32> result type"));
++            }
++            return Ok(Some(byte_swap_i32_vector(ctx, res, rty, elem, lanes, args[0])));
++        } else {
++            return Err(format!("{name} only i16 and i32 vectors are lowered"));
++        }
+     }
+     if name.starts_with("air.rotate.") && args.len() == 2 {
+         let width = int_scalar_width(ctx, rty)
+diff --git a/translator/translator/src/passes/air_calls/reduce_bitops.rs b/translator/translator/src/passes/air_calls/reduce_bitops.rs
+index 16aac36..939d548 100644
+--- a/translator/translator/src/passes/air_calls/reduce_bitops.rs
++++ b/translator/translator/src/passes/air_calls/reduce_bitops.rs
+@@ -519,6 +519,86 @@ pub(in crate::passes) fn rotate_left_i32(
+     ]
+ }
+ 
++
++pub(in crate::passes) fn byte_swap_i16(
++    ctx: &mut Ctx,
++    res: Word,
++    rty: Word,
++    value: Word,
++) -> Vec<Instruction> {
++    let mask_byte0 = ctx.const_int_of(rty, 0x00ff);
++    let mask_byte1 = ctx.const_int_of(rty, 0xff00);
++    let shift8 = ctx.const_int_of(rty, 8);
++    byte_swap_i16_with(ctx, res, rty, value, [mask_byte0, mask_byte1], shift8)
++}
++
++pub(in crate::passes) fn byte_swap_i16_vector(
++    ctx: &mut Ctx,
++    res: Word,
++    rty: Word,
++    elem: Word,
++    lanes: u32,
++    value: Word,
++) -> Vec<Instruction> {
++    let mut splat = |v: i64| {
++        let scalar = ctx.const_int_of(elem, v);
++        ctx.const_composite(rty, vec![scalar; lanes as usize])
++    };
++    let mask_byte0 = splat(0x00ff);
++    let mask_byte1 = splat(0xff00);
++    let shift8 = splat(8);
++    byte_swap_i16_with(ctx, res, rty, value, [mask_byte0, mask_byte1], shift8)
++}
++
++fn byte_swap_i16_with(
++    ctx: &mut Ctx,
++    res: Word,
++    rty: Word,
++    value: Word,
++    masks: [Word; 2],
++    shift8: Word,
++) -> Vec<Instruction> {
++    let [mask_byte0, mask_byte1] = masks;
++
++    let b0 = ctx.module.fresh_id();
++    let b1 = ctx.module.fresh_id();
++    let b0_hi = ctx.module.fresh_id();
++    let b1_lo = ctx.module.fresh_id();
++
++    vec![
++        Instruction::new(
++            Op::BitwiseAnd,
++            Some(rty),
++            Some(b0),
++            vec![Operand::IdRef(value), Operand::IdRef(mask_byte0)],
++        ),
++        Instruction::new(
++            Op::BitwiseAnd,
++            Some(rty),
++            Some(b1),
++            vec![Operand::IdRef(value), Operand::IdRef(mask_byte1)],
++        ),
++        Instruction::new(
++            Op::ShiftLeftLogical,
++            Some(rty),
++            Some(b0_hi),
++            vec![Operand::IdRef(b0), Operand::IdRef(shift8)],
++        ),
++        Instruction::new(
++            Op::ShiftRightLogical,
++            Some(rty),
++            Some(b1_lo),
++            vec![Operand::IdRef(b1), Operand::IdRef(shift8)],
++        ),
++        Instruction::new(
++            Op::BitwiseOr,
++            Some(rty),
++            Some(res),
++            vec![Operand::IdRef(b0_hi), Operand::IdRef(b1_lo)],
++        ),
++    ]
++}
++
+ pub(in crate::passes) fn byte_swap_i32(
+     ctx: &mut Ctx,
+     res: Word,
